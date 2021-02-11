@@ -506,7 +506,7 @@ message TournamentDivisionDeletedResponse {
 // Communication
 
 // When we go to a new path in our SPA, we send a JoinPath. When we leave the
-// path, we send an Unjoin realm. d
+// path, we send an Unjoin realm.
 message JoinPath { string path = 1; }
 
 message UnjoinRealm {}

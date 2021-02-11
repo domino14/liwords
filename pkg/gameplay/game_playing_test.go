@@ -2,6 +2,7 @@ package gameplay_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/golang/protobuf/proto"
@@ -64,7 +65,7 @@ func (ec *evtConsumer) consumeEventChan(ctx context.Context,
 }
 
 func makeGame(cfg *config.Config, ustore pkguser.Store, gstore gameplay.GameStore) (
-	*entity.Game, *entity.FakeNower, context.CancelFunc, chan bool, *evtConsumer) {
+	*entity.Game, context.CancelFunc, chan bool, *evtConsumer) {
 
 	ctx := context.Background()
 	cesar, _ := ustore.Get(ctx, "cesar4")
@@ -86,10 +87,11 @@ func makeGame(cfg *config.Config, ustore pkguser.Store, gstore gameplay.GameStor
 
 	nower := entity.NewFakeNower(1234)
 	g.SetTimerModule(nower)
+	gstore.Set(ctx, g)
 
 	gameplay.StartGame(ctx, gstore, ch, g.GameID())
 
-	return g, nower, cancel, donechan, consumer
+	return g, cancel, donechan, consumer
 }
 
 func TestInitializeGame(t *testing.T) {
@@ -101,7 +103,7 @@ func TestInitializeGame(t *testing.T) {
 	lstore := listStatStore(cstr)
 	cfg, gstore := gameStore(cstr, ustore)
 
-	g, _, cancel, donechan, consumer := makeGame(cfg, ustore, gstore)
+	g, cancel, donechan, consumer := makeGame(cfg, ustore, gstore)
 
 	is.Equal(g.PlayerOnTurn(), 1)
 	cancel()
@@ -123,7 +125,7 @@ func TestWrongTurn(t *testing.T) {
 	cfg, gstore := gameStore(cstr, ustore)
 	tstore := tournamentStore(cfg, gstore)
 
-	g, _, cancel, donechan, consumer := makeGame(cfg, ustore, gstore)
+	g, cancel, donechan, consumer := makeGame(cfg, ustore, gstore)
 
 	is.Equal(g.PlayerOnTurn(), 1)
 
@@ -160,7 +162,7 @@ func Test5ptBadWord(t *testing.T) {
 	cfg, gstore := gameStore(cstr, ustore)
 	tstore := tournamentStore(cfg, gstore)
 
-	g, nower, cancel, donechan, consumer := makeGame(cfg, ustore, gstore)
+	g, cancel, donechan, consumer := makeGame(cfg, ustore, gstore)
 
 	cge := &pb.ClientGameplayEvent{
 		Type:           pb.ClientGameplayEvent_TILE_PLACEMENT,
@@ -168,13 +170,13 @@ func Test5ptBadWord(t *testing.T) {
 		PositionCoords: "8D",
 		Tiles:          "BANJO",
 	}
-	g.SetRacksForBoth([]*alphabet.Rack{
-		alphabet.RackFromString("AGLSYYZ", g.Alphabet()),
-		alphabet.RackFromString("ABEJNOR", g.Alphabet()),
-	})
+	g.History().LastKnownRacks = []string{"AGLSYYZ", "ABEJNOR"}
+	err := gstore.Set(context.Background(), g)
+	is.NoErr(err)
+	nower := entity.NewFakeNower(0)
 	// "jesse" plays a word after some time
 	nower.Sleep(3750) // 3.75 secs
-	_, err := gameplay.HandleEvent(context.Background(), gstore, ustore, lstore, tstore,
+	_, err = gameplay.HandleEvent(context.Background(), gstore, ustore, lstore, tstore,
 		"3xpEkpRAy3AizbVmDg3kdi", cge)
 
 	is.NoErr(err)
@@ -208,7 +210,10 @@ func TestDoubleChallengeBadWord(t *testing.T) {
 	cfg, gstore := gameStore(cstr, ustore)
 	tstore := tournamentStore(cfg, gstore)
 
-	g, nower, cancel, donechan, consumer := makeGame(cfg, ustore, gstore)
+	g, cancel, donechan, consumer := makeGame(cfg, ustore, gstore)
+
+	nower := entity.NewFakeNower(1234)
+	g.SetTimerModule(nower)
 
 	cge := &pb.ClientGameplayEvent{
 		Type:           pb.ClientGameplayEvent_TILE_PLACEMENT,
@@ -273,8 +278,9 @@ func TestDoubleChallengeGoodWord(t *testing.T) {
 	cfg, gstore := gameStore(cstr, ustore)
 	tstore := tournamentStore(cfg, gstore)
 
-	g, nower, cancel, donechan, consumer := makeGame(cfg, ustore, gstore)
-
+	g, cancel, donechan, consumer := makeGame(cfg, ustore, gstore)
+	nower := entity.NewFakeNower(1234)
+	g.SetTimerModule(nower)
 	cge := &pb.ClientGameplayEvent{
 		Type:           pb.ClientGameplayEvent_TILE_PLACEMENT,
 		GameId:         g.GameID(),
@@ -336,8 +342,10 @@ func TestQuickdata(t *testing.T) {
 	cfg, gstore := gameStore(cstr, ustore)
 	tstore := tournamentStore(cfg, gstore)
 
-	g, nower, cancel, donechan, _ := makeGame(cfg, ustore, gstore)
+	g, cancel, donechan, _ := makeGame(cfg, ustore, gstore)
 	ctx := context.WithValue(context.Background(), gameplay.ConfigCtxKey("config"), &DefaultConfig)
+	nower := entity.NewFakeNower(1234)
+	g.SetTimerModule(nower)
 
 	cge1 := &pb.ClientGameplayEvent{
 		Type:           pb.ClientGameplayEvent_TILE_PLACEMENT,
@@ -391,6 +399,79 @@ func TestQuickdata(t *testing.T) {
 	// Kill the go-routine
 	cancel()
 	<-donechan
+	ustore.(*user.DBStore).Disconnect()
+	lstore.(*stats.ListStatStore).Disconnect()
+	gstore.(*game.Cache).Disconnect()
+	tstore.(*ts.Cache).Disconnect()
+}
+
+func TestAtomicEnd(t *testing.T) {
+	is := is.New(t)
+	recreateDB()
+	cstr := TestingDBConnStr + " dbname=liwords_test"
+
+	ustore := userStore(cstr)
+	lstore := listStatStore(cstr)
+	cfg, gstore := gameStore(cstr, ustore)
+	tstore := tournamentStore(cfg, gstore)
+
+	g, cancel, donechan, consumer := makeGame(cfg, ustore, gstore)
+	nower := entity.NewFakeNower(1234)
+	g.SetTimerModule(nower)
+	cge := &pb.ClientGameplayEvent{
+		Type:           pb.ClientGameplayEvent_TILE_PLACEMENT,
+		GameId:         g.GameID(),
+		PositionCoords: "8D",
+		Tiles:          "BANJO",
+	}
+	g.SetChallengeRule(macondopb.ChallengeRule_DOUBLE)
+	g.SetRacksForBoth([]*alphabet.Rack{
+		alphabet.RackFromString("AGLSYYZ", g.Alphabet()),
+		alphabet.RackFromString("ABEJNOR", g.Alphabet()),
+	})
+
+	// "jesse" plays a word after some time
+	nower.Sleep(3750) // 3.75 secs
+	_, err := gameplay.HandleEvent(context.Background(), gstore, ustore, lstore, tstore,
+		"3xpEkpRAy3AizbVmDg3kdi", cge)
+
+	is.NoErr(err)
+	// "sleep" 25 minutes.
+	nower.Sleep(25 * 60)
+
+	// Now call TimedOut many times simultaneously.
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			// xjCWug7EZtDxDHX5fRZTLo is the player that timed out
+			err := gameplay.TimedOut(context.Background(), gstore, ustore, lstore, tstore,
+				"xjCWug7EZtDxDHX5fRZTLo", g.GameID())
+			is.NoErr(err)
+			wg.Done()
+		}()
+	}
+
+	wg.Wait()
+	// Kill the go-routine
+	cancel()
+	<-donechan
+
+	// There should only be one single game ended event.
+	log.Info().Interface("evts", consumer.evts).Msg("evts")
+	// evts: history, banjo, game ended event, game deletion
+	is.Equal(len(consumer.evts), 4)
+	// get some fields to make sure the move was played properly.
+	evt := consumer.evts[1].Event.(*pb.ServerGameplayEvent)
+	is.Equal(evt.Event.Score, int32(34))
+	is.Equal(evt.UserId, "3xpEkpRAy3AizbVmDg3kdi")
+	is.Equal(evt.TimeRemaining, int32((25*60000)+1250))
+	geevt := consumer.evts[2].Event.(*pb.GameEndedEvent)
+	// the player that timed out loses
+	is.Equal(geevt.Loser, "xjCWug7EZtDxDHX5fRZTLo")
+	evt = consumer.evts[3].Event.(*pb.ServerGameplayEvent)
+	is.Equal(consumer.evts[3].Event.(*pb.GameDeletion).Id, g.GameID())
+
 	ustore.(*user.DBStore).Disconnect()
 	lstore.(*stats.ListStatStore).Disconnect()
 	gstore.(*game.Cache).Disconnect()

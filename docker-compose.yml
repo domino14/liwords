@@ -1,7 +1,7 @@
 version: "3"
 
 services:
-  app:
+  app: &appsetup
     build:
       context: .
       dockerfile: Dockerfile-dev
@@ -24,13 +24,13 @@ services:
     depends_on: ["db", "proxy", "nats", "socket", "redis"]
     networks:
       - aeronet
-    ports:
-      - "8001:8001"
     labels:
       - "traefik.http.routers.liwords.rule=Host(`liwords.localhost`) && PathPrefix(`/twirp/`)"
       - "traefik.http.routers.liwords.entrypoints=web"
       - "traefik.http.services.liwords.loadbalancer.server.port=8001"
       - traefik.enable=true
+  # Scaling.
+  app2: *appsetup
 
   bot:
     build:
@@ -153,3 +153,7 @@ volumes:
     external: false
   redis-data-volume:
     external: false
+
+# bringing up multiple servers, e.g.
+# docker-compose up --scale socket=2
+# docker-compose up --scale app=2

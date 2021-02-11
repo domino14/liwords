@@ -26,6 +26,7 @@ import (
 	"github.com/domino14/liwords/pkg/config"
 	"github.com/domino14/liwords/pkg/entity"
 	"github.com/domino14/liwords/pkg/stats"
+	gstore "github.com/domino14/liwords/pkg/stores/game"
 	"github.com/domino14/liwords/pkg/tournament"
 	"github.com/domino14/liwords/pkg/user"
 	gs "github.com/domino14/liwords/rpc/api/proto/game_service"
@@ -34,6 +35,7 @@ import (
 
 var (
 	errGameNotActive   = errors.New("game is not currently active")
+	errGameSyncError   = errors.New("game synchronization error")
 	errNotOnTurn       = errors.New("player not on turn")
 	errTimeDidntRunOut = errors.New("got time ran out, but it did not actually")
 )
@@ -41,6 +43,7 @@ var (
 // GameStore is an interface for getting a full game.
 type GameStore interface {
 	Get(ctx context.Context, id string) (*entity.Game, error)
+	GetFromBacking(ctx context.Context, id string) (*entity.Game, error)
 	GetMetadata(ctx context.Context, id string) (*gs.GameInfoResponse, error)
 	GetRematchStreak(ctx context.Context, originalRequestId string) (*gs.StreakInfoResponse, error)
 	GetRecentGames(ctx context.Context, username string, numGames int, offset int) (*gs.GameInfoResponses, error)
@@ -54,6 +57,7 @@ type GameStore interface {
 	SetGameEventChan(c chan<- *entity.EventWrapper)
 	Unload(context.Context, string)
 	SetReady(ctx context.Context, gid string, pidx int) (int, error)
+	SetGameEndReason(ctx context.Context, g *entity.Game) error
 	GetHistory(ctx context.Context, id string) (*macondopb.GameHistory, error)
 }
 
@@ -438,22 +442,19 @@ func PlayMove(ctx context.Context,
 
 // HandleEvent handles a gameplay event from the socket
 func HandleEvent(ctx context.Context, gameStore GameStore, userStore user.Store,
-	listStatStore stats.ListStatStore, tournamentStore tournament.TournamentStore, userID string, cge *pb.ClientGameplayEvent) (*entity.Game, error) {
+	listStatStore stats.ListStatStore, tournamentStore tournament.TournamentStore,
+	userID string, cge *pb.ClientGameplayEvent) (*entity.Game, error) {
 
-	// XXX: VERIFY THAT THE CLIENT GAME ID CORRESPONDS TO THE GAME
-	// THE PLAYER IS PLAYING!
 	entGame, err := gameStore.Get(ctx, cge.GameId)
 	if err != nil {
 		return nil, err
 	}
-	entGame.Lock()
-	defer entGame.Unlock()
 
-	return handleEventAfterLockingGame(ctx, gameStore, userStore, listStatStore, tournamentStore, userID, cge, entGame)
+	return handleEventWithGame(ctx, gameStore, userStore, listStatStore,
+		tournamentStore, userID, cge, entGame)
 }
 
-// Assume entGame is already locked.
-func handleEventAfterLockingGame(ctx context.Context, gameStore GameStore, userStore user.Store,
+func handleEventWithGame(ctx context.Context, gameStore GameStore, userStore user.Store,
 	listStatStore stats.ListStatStore, tournamentStore tournament.TournamentStore, userID string, cge *pb.ClientGameplayEvent,
 	entGame *entity.Game) (*entity.Game, error) {
 
@@ -522,8 +523,7 @@ func handleEventAfterLockingGame(ctx context.Context, gameStore GameStore, userS
 		}
 	}
 	// If the game hasn't ended yet, save it to the store. If it HAS ended,
-	// it was already saved to the store somewhere above (in performEndgameDuties)
-	// and we don't want to save it again as it will reload it into the cache.
+	// it was already saved to the store above in performEndgameDuties
 	if entGame.GameEndReason == pb.GameEndReason_NONE {
 		if err := gameStore.Set(ctx, entGame); err != nil {
 			log.Err(err).Msg("error-saving")
@@ -537,16 +537,16 @@ func handleEventAfterLockingGame(ctx context.Context, gameStore GameStore, userS
 // verify that that is actually the case.
 func TimedOut(ctx context.Context, gameStore GameStore, userStore user.Store,
 	listStatStore stats.ListStatStore, tournamentStore tournament.TournamentStore, timedout string, gameID string) error {
-	// XXX: VERIFY THAT THE GAME ID is the client's current game!!
 	// Note: we can get this event multiple times; the opponent and the player on turn
-	// both send it.
+	// both send it, as well as the adjudicator.
 	log.Debug().Str("timedout", timedout).Msg("got-timed-out")
-	entGame, err := gameStore.Get(ctx, gameID)
+	// Bust the cache for this signal.
+	entGame, err := gameStore.(*gstore.Cache).GetFromBacking(ctx, gameID)
 	if err != nil {
 		return err
 	}
-	entGame.Lock()
-	defer entGame.Unlock()
+	// We need some way of locking here so that the game end stuff doesn't get run
+	// multiple times across different threads / nodes.
 	if entGame.Game.Playing() == macondopb.PlayState_GAME_OVER {
 		log.Debug().Msg("game not active anymore.")
 		return nil
@@ -567,7 +567,7 @@ func TimedOut(ctx context.Context, gameStore GameStore, userStore user.Store,
 	// If opponent played out, auto-pass instead of forfeiting.
 	if entGame.Game.Playing() == macondopb.PlayState_WAITING_FOR_FINAL_PASS {
 		log.Debug().Msg("timed out, so auto-passing instead of forfeiting")
-		_, err = handleEventAfterLockingGame(ctx, gameStore, userStore, listStatStore, tournamentStore,
+		_, err = handleEventWithGame(ctx, gameStore, userStore, listStatStore, tournamentStore,
 			entGame.Game.PlayerIDOnTurn(), &pb.ClientGameplayEvent{
 				Type:   pb.ClientGameplayEvent_PASS,
 				GameId: gameID,

@@ -30,6 +30,10 @@ import (
 	macondopb "github.com/domino14/macondo/gen/api/proto/macondo"
 )
 
+var (
+	ErrGameAlreadyOver = errors.New("game is already over")
+)
+
 const (
 	MaxRecentGames = 20
 )
@@ -314,7 +318,13 @@ func fromState(timers entity.Timers, qdata *entity.Quickdata, Started bool,
 		Quickdata:     qdata,
 		CreatedAt:     createdAt,
 	}
-	g.SetTimerModule(&entity.GameTimer{})
+	if timers.Nower == "FakeNower" {
+		// For test purposes
+		g.SetTimerModule(&entity.FakeNower{})
+	} else {
+		// Pretty much anytime on production.
+		g.SetTimerModule(&entity.GameTimer{})
+	}
 
 	// Now copy the request
 	req := &pb.GameRequest{}
@@ -498,6 +508,24 @@ func (s *DBStore) SetReady(ctx context.Context, gid string, pidx int) (int, erro
 	return rf.ReadyFlag, result.Error
 }
 
+// SetGameEndReason updates the endgame reason in an atomic fashion. It
+// will return an error if the endgame reason was already set.
+func (s *DBStore) SetGameEndReason(ctx context.Context, g *entity.Game) error {
+	ctxDB := s.db.WithContext(ctx)
+
+	result := ctxDB.Raw(`update games set game_end_reason = ? where uuid = ?
+		and game_end_reason = ?`, g.GameEndReason, pb.GameEndReason_NONE)
+
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return ErrGameAlreadyOver
+	}
+
+	return nil
+}
+
 func (s *DBStore) toDBObj(g *entity.Game) (*game, error) {
 	timers, err := json.Marshal(g.Timers)
 	if err != nil {
@@ -511,7 +539,6 @@ func (s *DBStore) toDBObj(g *entity.Game) (*game, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Debug().Str("quickdata", string(quickdata)).Msg("quickdata")
 	req, err := proto.Marshal(g.GameReq)
 	if err != nil {
 		return nil, err
