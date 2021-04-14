@@ -1,20 +1,48 @@
 package mod
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/golang/protobuf/ptypes"
+	"github.com/rs/zerolog/log"
+	"net/http"
 	"time"
 
-	"github.com/golang/protobuf/ptypes"
-
 	"github.com/domino14/liwords/pkg/apiserver"
+	"github.com/domino14/liwords/pkg/emailer"
 	"github.com/domino14/liwords/pkg/entity"
 	"github.com/domino14/liwords/pkg/user"
 	ms "github.com/domino14/liwords/rpc/api/proto/mod_service"
 
 	pb "github.com/domino14/liwords/rpc/api/proto/realtime"
 )
+
+const ModActionEmailTemplate = `
+Dear Woogles.io user,
+
+The following action was taken against your account:
+
+%s
+
+If you think this was an error, please contact conduct@woogles.io.
+
+The Woogles.io team
+`
+
+var DiscordTarget = "https://discord.com/api/webhooks/"
+
+var ModActionEmailMap = map[ms.ModActionType]string{
+	ms.ModActionType_MUTE:                    "Disable Chat",
+	ms.ModActionType_SUSPEND_ACCOUNT:         "Account Suspension",
+	ms.ModActionType_SUSPEND_RATED_GAMES:     "Disable Rated Games",
+	ms.ModActionType_SUSPEND_GAMES:           "Disable Games",
+	ms.ModActionType_RESET_RATINGS:           "Reset Ratings",
+	ms.ModActionType_RESET_STATS:             "Reset Statistics",
+	ms.ModActionType_RESET_STATS_AND_RATINGS: "Reset Ratings and Statistics",
+}
 
 var ModActionDispatching = map[string]func(context.Context, user.Store, user.ChatStore, *ms.ModAction) error{
 
@@ -148,14 +176,15 @@ func GetActionHistory(ctx context.Context, us user.Store, uuid string) ([]*ms.Mo
 	return user.Actions.History, nil
 }
 
-func ApplyActions(ctx context.Context, us user.Store, cs user.ChatStore, actions []*ms.ModAction) error {
+func ApplyActions(ctx context.Context, us user.Store, cs user.ChatStore,
+	mailgunKey string, discordToken string, actions []*ms.ModAction) error {
 	applierUserId, err := sessionUserId(ctx, us)
 	if err != nil {
 		return err
 	}
 	for _, action := range actions {
 		action.ApplierUserId = applierUserId
-		err := applyAction(ctx, us, cs, action)
+		err := applyAction(ctx, us, cs, mailgunKey, discordToken, action)
 		if err != nil {
 			return err
 		}
@@ -218,7 +247,8 @@ func removeAction(ctx context.Context, us user.Store, action *ms.ModAction, remo
 	return us.Set(ctx, user)
 }
 
-func applyAction(ctx context.Context, us user.Store, cs user.ChatStore, action *ms.ModAction) error {
+func applyAction(ctx context.Context, us user.Store, cs user.ChatStore,
+	mailgunKey string, discordToken string, action *ms.ModAction) error {
 	user, err := us.GetByUUID(ctx, action.UserId)
 	if err != nil {
 		return err
@@ -256,6 +286,55 @@ func applyAction(ctx context.Context, us user.Store, cs user.ChatStore, action *
 		err = setCurrentAction(user, action)
 		if err != nil {
 			return err
+		}
+	}
+
+	actionEmailText, ok := ModActionEmailMap[action.Type]
+	if ok {
+		if mailgunKey != "" {
+			_, err := emailer.SendSimpleMessage(mailgunKey, user.Email, fmt.Sprintf("Account Taken Against %s", user.Username),
+				fmt.Sprintf(ModActionEmailTemplate, actionEmailText))
+			if err != nil {
+				// Errors should not be fatal, just log them
+				log.Err(err).Str("userID", user.UUID).Msg("mod-action-user-email")
+			}
+		}
+		if discordToken != "" {
+			modUser, err := us.GetByUUID(ctx, action.ApplierUserId)
+			if err != nil {
+				log.Err(err).Str("userID", user.UUID).Msg("mod-action-applier")
+			} else {
+				message := fmt.Sprintf("Action %s was applied to user %s by moderator %s.", actionEmailText, user.Username, modUser.Username)
+				if !actionExists { // Action is non-transient
+					if action.Duration == 0 {
+						message += " This action is permanent."
+					} else if action.EndTime == nil {
+						log.Err(err).Str("userID", user.UUID).Msg("mod-action-endtime-nil")
+					} else {
+						golangActionEndTime, err := ptypes.Timestamp(action.EndTime)
+						if err != nil {
+							log.Err(err).Str("error", err.Error()).Msg("mod-action-endtime-conversion")
+						} else {
+							message += fmt.Sprintf(" This action will expire on %s.", golangActionEndTime.UTC().Format(time.UnixDate))
+						}
+					}
+				}
+				requestBody, err := json.Marshal(map[string]string{"content": message})
+
+				// Errors should not be fatal, just log them
+				if err != nil {
+					log.Err(err).Str("error", err.Error()).Msg("mod-action-discord-notification-marshal")
+				} else {
+					resp, err := http.Post(DiscordTarget+discordToken, "application/json", bytes.NewBuffer(requestBody))
+					// Errors should not be fatal, just log them
+					if err != nil {
+						log.Err(err).Str("error", err.Error()).Msg("mod-action-discord-notification-post-error")
+					} else if resp.StatusCode != 204 { // No Content
+						// We do not expect any other response
+						log.Err(err).Str("status", resp.Status).Msg("mod-action-discord-notification-post-bad-response")
+					}
+				}
+			}
 		}
 	}
 
